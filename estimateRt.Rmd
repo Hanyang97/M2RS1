@@ -1,0 +1,118 @@
+---
+title: "estimateRt"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(COVID19)
+```
+
+function for infection potential
+
+```{r}
+inf_pot <- function(locnum, impnum, day){
+  '
+  input: locnum/ impnum: local and imported incidents
+                         (day + 1)-dimentional vector 
+         day: one dimentional vector (0-indexed)
+  output: one dimention infection potential on day
+  '
+  
+  totnum = locnum + impnum
+  omega_mat = c()
+  for (n in 1:day){
+    # use recommended serial distribution
+    omega = pgamma(n+0.5, shape = 6.5, rate = 0.62) - pgamma(n-0.5, shape = 6.5, rate = 0.62)
+    omega_mat[n] = omega
+  }
+  omega_mat = matrix(omega_mat)
+  totnum_mat = matrix(totnum[day:1], nrow = 1,  ncol = day)
+  infectionpot = c(totnum_mat %*% omega_mat)
+  return(infectionpot)
+}
+```
+
+function for Rt value
+
+```{r}
+covidRt <- function(locnum, impnum, day, start_shape = 1, start_rate = 0.2, timewindow = 1, CI = 0.95){
+  '
+  arguments: 
+  
+  locnum/ impnum: (day + 1)-dimentional vector
+  day: one dimention (0-indexed)
+  start_shape/start_rate: parameter for prior
+  timewindow: reproduction number is constant over [t-timewindow+1, t]
+  CI
+  
+  return:
+  
+  Rt value on day, lower and upper for CI
+  '
+  
+  locnum_sum = 0
+  infpot_sum = 0
+  for (n in (day-timewindow+1):day){
+    locnum_sum = locnum_sum + locnum[n+1]
+    infpot_sum = infpot_sum + inf_pot(locnum, impnum, n)
+  }
+  newshape = start_shape + locnum_sum
+  newrate = start_rate + infpot_sum
+  # we take mean of poisson distribution as Rt
+  Rt = newshape / newrate
+  # l and u for CI
+  l = qgamma((1-CI)/2, shape = newshape, rate = newrate)
+  u = qgamma(1-(1-CI)/2, shape = newshape, rate = newrate)
+  return(c(Rt, l, u))
+}
+```
+
+simple preprocessing function
+
+```{r}
+cumutodaily <- function(df){
+  '
+  df: vertical dataframe representing cumulative infection number
+  '
+  for (n in length(df):2){
+    df[n] = df[n] - df[n-1]
+  }
+  return(df)
+}
+```
+
+trial case for UK
+Assuming all incidents are from local
+
+```{r}
+df = covid19(country = 'GBR')
+df$incidents = cumutodaily(df$confirmed)
+daynum = length(df$date) - 1
+tau = 4
+Rt_list = rep(0,k)
+l_list = rep(0,k)
+u_list = rep(0,k)
+for (n in tau:daynum){
+  parameter = covidRt(locnum = c(df$incidents), 
+                      impnum = 0, 
+                      day = n,
+                      timewindow = tau,
+                      )
+  Rt_list[n+1] = parameter[1]
+  l_list[n+1] = parameter[2]
+  u_list[n+1] = parameter[3]
+}
+df$Rt = Rt_list
+df$lower = l_list
+df$upper = u_list
+a = ggplot(data = df, aes(x= df$date,y = df$Rt,))+geom_path() + ylim(0, 10)
+a = a + geom_hline(yintercept = 1)
+a = a + geom_ribbon(aes(ymin = l_list, ymax = u_list),linetype = 2, alpha = 0.1)
+a
+```
+
