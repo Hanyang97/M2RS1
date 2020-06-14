@@ -1,0 +1,240 @@
+---
+title: "estimateRtimproved"
+author: "Hanyang Liu"
+date: "6/9/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+library(rstan)
+```
+1. Obtain the infection potential 
+
+```{r serial interval}
+inf_pot <- function(locnum, impnum, day){
+  '
+  function to find infection potential
+  
+  arguments: 
+  locnum/ impnum: local and imported incidents
+                  (day + 1) rownum and 1 colnum dataframe   `
+                  
+                  
+  day: one dimentional vector (0-indexed)
+         
+  return: 
+  one dimention infection potential on day t
+  '
+  
+  totnum = locnum + impnum
+  omega_mat = c()
+  for (n in 1:day){
+    # use recommended serial distribution
+    omega = pgamma(n+0.5, shape = 6.5, rate = 0.62) - pgamma(n-0.5, shape = 6.5, rate = 0.62)
+    omega_mat[n] = omega
+  }
+  # normalize the data
+  omega_mat = omega_mat/ (1-pgamma(0.5, shape = 6.5, rate = 0.62))
+  omega_mat = matrix(omega_mat)
+  totnum_mat = matrix(totnum[day:1,1], nrow = 1,  ncol = day)
+  infectionpot = c(totnum_mat %*% omega_mat)
+  return(infectionpot)
+}
+```
+
+
+
+2. Perform Bayesian Analysis
+
+```{r Bayesian Analysis}
+covidRt <- function(locnum, impnum, day, start_shape, start_rate, timewindow, CI){
+  '
+  function to find Rt, l and u according to CI on certain day
+  
+  arguments: 
+  locnum/ impnum: (day + 1) rownum and 1 colnum dataframe
+  day: one dimention (0-indexed)
+  start_shape/start_rate: parameters for prior
+  timewindow: reproduction number is constant over [t-timewindow+1, t]
+  CI: probability of credible interval
+  
+  return:
+  MEAN Rt value on day, Lambda, lower bound of CI, upper bound of CI
+  newshape, newrate
+  '
+  
+  locnum_sum = 0
+  infpot_sum = 0
+  for (n in (day-timewindow+1):day){
+    locnum_sum = locnum_sum + c(locnum[n+1,1])
+    infpot_sum = infpot_sum + inf_pot(locnum, impnum, n)
+  }
+  newshape = start_shape + locnum_sum
+  newrate = start_rate + infpot_sum
+  # we take mean of poisson distribution as Rt
+  Rt = newshape / newrate
+  # l and u for CI
+  Lambda = inf_pot(locnum, impnum, day)
+  l = qgamma((1-CI)/2, shape = newshape, rate = newrate)
+  u = qgamma(1-(1-CI)/2, shape = newshape, rate = newrate)
+  # update shape and rate
+  return(c(Rt, Lambda, l, u, newshape, newrate))
+}
+
+```
+
+3. Obtaining summary statistics
+
+```{r summary}
+covidRt_summary <- function(df, startshape = 1, 
+                            startrate = 0.2, tau = 1, ci = 0.95){
+  '
+  function to add Rt, l and u columns to dataset
+  
+  arguments:
+  df: 2(3) columns dataframe: Date, local_daily_increase, (import_daily_increase) in order
+  startshape: prior shape
+  startrate: prior rate
+  tau: timewindow to make reproduction number constant over [t-tau+1, t]
+  ci: credible interval
+  
+  return:
+  updated dataframe with new columns Rt, lower and upper
+  '
+  
+  # to ensure column numbers as required
+  stopifnot(ncol(df)>=2, ncol(df)<=3)
+  # add import incidents if missing
+  if (ncol(df) == 2){
+    df$import_daily = 0
+  }
+  # initiate values
+  Rt_list = rep(0,tau)
+  l_list = rep(0,tau)
+  u_list = rep(0,tau)
+  Lambda_list = rep(0,tau)
+  shape_list = rep(0,tau)
+  rate_list = rep(0,tau)
+  daynum = nrow(df) - 1
+  # for loop to update values
+  for (iterations in tau:daynum){
+    parameter = covidRt(locnum = df[2], 
+                        impnum = df[3], 
+                        day = iterations,
+                        timewindow = tau,
+                        start_shape  = startshape,
+                        start_rate = startrate,
+                        CI = ci)
+    Rt_list[iterations+1] = parameter[1]
+    Lambda_list[iterations+1] = parameter[2]
+    l_list[iterations+1] = parameter[3]
+    u_list[iterations+1] = parameter[4]
+    shape_list[iterations+1] = parameter[5]
+    rate_list[iterations+1] = parameter[6]
+  }
+  # add columns to dataframe
+  df$Rt = Rt_list
+  df$Lambda = Lambda_list
+  df$lower = l_list
+  df$upper = u_list
+  df$expect_incidence = df$Rt * df$Lambda
+  df$shape = shape_list
+  df$rate = rate_list
+  return(df)
+}
+```
+
+simple preprocessing function
+
+```{r preprocessing function}
+cumutodaily <- function(df){
+  '
+  Arguments: 
+  df: single column dataframe representing cumulative infection number
+  
+  Return:
+  preprocessed dataframe
+  '
+  # to clean levels in dataframe
+  df = as.numeric(as.character(df))
+  # subtraction
+  for (n in length(df):2){
+    df[n] = df[n] - df[n-1]
+  }
+  return(df)
+}
+
+preprocessing <- function(df_date, df_confirmed){
+  '
+  arguments:
+  df: dataframe
+  df_date: dataframe reprerents column of date
+  df_confirmed: dateframe represents column of cumulative confirmed cases
+  
+  return:
+  preprocessed dataframe
+  '
+  pproc_cumu_confirmed = cumutodaily(df_confirmed)
+  pproc_df = data.frame(date = df_date, incidents = pproc_cumu_confirmed)
+  return(pproc_df)
+}
+```
+
+
+```{r preprocessing global data}
+# read csv from your file location
+df = read.csv('time_series_covid19_confirmed_global.csv', check.names=FALSE)
+region = paste(df$'Country/Region', df$'Province/State', sep = '')
+df = df[-(1:4)]
+df = data.frame(t(df))
+df = add_rownames(df, var = "date")
+df$date <- as.Date(df$date)
+colnames(df)[2:ncol(df)] = region
+df$`United Kingdom`[120] = (df$`United Kingdom`[119]+df$`United Kingdom`[121])/2
+UK_df = covidRt_summary(preprocessing(df$date, df$`United Kingdom`))[65:133,]
+uktest = read.csv('UK_testing_time_series.csv')
+uktest = uktest[-(70:79),]
+UK_df = data.frame(date = UK_df$date,
+                   incidents = UK_df$incidents,
+                   Lambda = UK_df$Lambda,
+                   tests = uktest$Total)
+UK_df = UK_df[-(1:5),]
+UK_df
+```
+
+
+```{r}
+underreportingmodel = 'Rtunderreporting.stan'
+uk_dat = list(N = nrow(UK_df),
+              I = as.integer(matrix(UK_df$incidents)),
+              T = as.integer(matrix(UK_df$tests)),
+              num_pop = 67886011,
+              infection_potential = c(UK_df$Lambda)
+              )
+uk_underre_fit <- stan(file = underreportingmodel, 
+            data = uk_dat, 
+            iter = 10000, 
+            chains = 4,)
+```
+
+```{r}
+print(uk_underre_fit, pars = 'Rt')
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

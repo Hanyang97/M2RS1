@@ -1,0 +1,550 @@
+---
+title: "estimateRtintervention"
+author: "Hanyang Liu"
+date: "6/9/2020"
+output: html_document
+---
+
+```{r}
+library(rstan)
+library(ggplot2)
+library(dplyr)
+library("bayesplot")
+theme_set(bayesplot::theme_default(base_family = "sans"))
+library(loo)
+library(gridExtra)
+```
+
+
+1. Obtain the infection potential 
+
+```{r serial interval}
+inf_pot <- function(locnum, impnum, day){
+  '
+  function to find infection potential
+  
+  arguments: 
+  locnum/ impnum: local and imported incidents
+                  (day + 1) rownum and 1 colnum dataframe   `
+                  
+                  
+  day: one dimentional vector (0-indexed)
+         
+  return: 
+  one dimention infection potential on day t
+  '
+  
+  totnum = locnum + impnum
+  omega_mat = c()
+  for (n in 1:day){
+    # use recommended serial distribution
+    omega = pgamma(n+0.5, shape = 6.5, rate = 0.62) - pgamma(n-0.5, shape = 6.5, rate = 0.62)
+    omega_mat[n] = omega
+  }
+  # normalize the data
+  omega_mat = omega_mat/ (1-pgamma(0.5, shape = 6.5, rate = 0.62))
+  omega_mat = matrix(omega_mat)
+  totnum_mat = matrix(totnum[day:1,1], nrow = 1,  ncol = day)
+  infectionpot = c(totnum_mat %*% omega_mat)
+  return(infectionpot)
+}
+```
+
+
+
+2. Perform Bayesian Analysis
+
+```{r Bayesian Analysis}
+covidRt <- function(locnum, impnum, day, start_shape, start_rate, timewindow, CI){
+  '
+  function to find Rt, l and u according to CI on certain day
+  
+  arguments: 
+  locnum/ impnum: (day + 1) rownum and 1 colnum dataframe
+  day: one dimention (0-indexed)
+  start_shape/start_rate: parameters for prior
+  timewindow: reproduction number is constant over [t-timewindow+1, t]
+  CI: probability of credible interval
+  
+  return:
+  MEAN Rt value on day, Lambda, lower bound of CI, upper bound of CI
+  newshape, newrate
+  '
+  
+  locnum_sum = 0
+  infpot_sum = 0
+  for (n in (day-timewindow+1):day){
+    locnum_sum = locnum_sum + c(locnum[n+1,1])
+    infpot_sum = infpot_sum + inf_pot(locnum, impnum, n)
+  }
+  newshape = start_shape + locnum_sum
+  newrate = start_rate + infpot_sum
+  # we take mean of poisson distribution as Rt
+  Rt = newshape / newrate
+  # l and u for CI
+  Lambda = inf_pot(locnum, impnum, day)
+  l = qgamma((1-CI)/2, shape = newshape, rate = newrate)
+  u = qgamma(1-(1-CI)/2, shape = newshape, rate = newrate)
+  # update shape and rate
+  return(c(Rt, Lambda, l, u, newshape, newrate))
+}
+
+```
+
+3. Obtaining summary statistics
+
+```{r summary}
+covidRt_summary <- function(df, startshape = 1, 
+                            startrate = 0.2, tau = 1, ci = 0.95){
+  '
+  function to add Rt, l and u columns to dataset
+  
+  arguments:
+  df: 2(3) columns dataframe: Date, local_daily_increase, (import_daily_increase) in order
+  startshape: prior shape
+  startrate: prior rate
+  tau: timewindow to make reproduction number constant over [t-tau+1, t]
+  ci: credible interval
+  
+  return:
+  updated dataframe with new columns Rt, lower and upper
+  '
+  
+  # to ensure column numbers as required
+  stopifnot(ncol(df)>=2, ncol(df)<=3)
+  # add import incidents if missing
+  if (ncol(df) == 2){
+    df$import_daily = 0
+  }
+  # initiate values
+  Rt_list = rep(0,tau)
+  l_list = rep(0,tau)
+  u_list = rep(0,tau)
+  Lambda_list = rep(0,tau)
+  shape_list = rep(0,tau)
+  rate_list = rep(0,tau)
+  daynum = nrow(df) - 1
+  # for loop to update values
+  for (iterations in tau:daynum){
+    parameter = covidRt(locnum = df[2], 
+                        impnum = df[3], 
+                        day = iterations,
+                        timewindow = tau,
+                        start_shape  = startshape,
+                        start_rate = startrate,
+                        CI = ci)
+    Rt_list[iterations+1] = parameter[1]
+    Lambda_list[iterations+1] = parameter[2]
+    l_list[iterations+1] = parameter[3]
+    u_list[iterations+1] = parameter[4]
+    shape_list[iterations+1] = parameter[5]
+    rate_list[iterations+1] = parameter[6]
+  }
+  # add columns to dataframe
+  df$Rt = Rt_list
+  df$Lambda = Lambda_list
+  df$lower = l_list
+  df$upper = u_list
+  df$expect_incidence = df$Rt * df$Lambda
+  df$shape = shape_list
+  df$rate = rate_list
+  return(df)
+}
+```
+
+simple preprocessing function
+
+```{r preprocessing function}
+cumutodaily <- function(df){
+  '
+  Arguments: 
+  df: single column dataframe representing cumulative infection number
+  
+  Return:
+  preprocessed dataframe
+  '
+  # to clean levels in dataframe
+  df = as.numeric(as.character(df))
+  # subtraction
+  for (n in length(df):2){
+    df[n] = df[n] - df[n-1]
+  }
+  return(df)
+}
+
+preprocessing <- function(df_date, df_confirmed){
+  '
+  arguments:
+  df: dataframe
+  df_date: dataframe reprerents column of date
+  df_confirmed: dateframe represents column of cumulative confirmed cases
+  
+  return:
+  preprocessed dataframe
+  '
+  pproc_cumu_confirmed = cumutodaily(df_confirmed)
+  pproc_df = data.frame(date = df_date, incidents = pproc_cumu_confirmed)
+  return(pproc_df)
+}
+```
+
+
+```{r preprocessing global data}
+# read csv from your file location
+df = read.csv('time_series_covid19_confirmed_global.csv', check.names=FALSE)
+region = paste(df$'Country/Region', df$'Province/State', sep = '')
+df = df[-(1:4)]
+df = data.frame(t(df))
+df = add_rownames(df, var = "date")
+df$date <- as.Date(df$date)
+colnames(df)[2:ncol(df)] = region
+df
+```
+
+new function starts from now:
+
+a preprocessing function for intervention model
+
+```{r}
+transform_intervention_df <- function(date, region){
+  df = covidRt_summary(preprocessing(date, region),
+                       tau = 1,
+                       )
+  df = data.frame(date = df$date, incidents = df$incidents, Lambda = df$Lambda)
+  df = df[-1,]
+  rownames(df) <- NULL
+  return(df)
+}
+```
+
+functions used to initiate data for stan functions
+
+```{r}
+intervention_days_select <- function(datedf, intervention_days){
+  '
+  '
+  validdays = c()
+  for (day in 1:length(intervention_days)){
+    if (any(datedf == intervention_days[day])){
+      validdays = c(validdays, c(intervention_days[day]))
+    } else{
+      print(sprintf('%s is not in our date range', intervention_days[day]))
+    }
+  }
+  return(validdays)
+}
+
+initiate_dat = function(intervention_df, intervention_days, alphavar = 1, betavar = 1,
+                        alpha0mean = 0, alpha0var = 1){
+  incidents = as.integer(intervention_df$incidents)
+  infection_potential = intervention_df$Lambda
+  N = length(incidents)
+  intervention_days = intervention_days_select(intervention_df$date, intervention_days)
+  intervention_times = length(intervention_days)
+  stopifnot(intervention_times > 0)
+  intervention = matrix(0, nrow = N, ncol = intervention_times)
+  for (n in 1:intervention_times){
+    intervention[match(intervention_days[n], as.character(intervention_df$date)):N,n] = 1
+  }
+  alphasd = sqrt(alphavar)
+  betasd = sqrt(betavar)
+  alpha0sd = sqrt(alpha0var)
+
+  return(list(N = N,
+              incidents = incidents,
+              infec_pot = infection_potential,
+              intervention_times = intervention_times,
+              intervention = intervention, 
+              alphasd = alphasd,
+              betasd = betasd,
+              alpha0mean = alpha0mean,
+              alpha0sd = alpha0sd))
+}
+```
+
+I have checked Chinese websites, there are some wrong data. have corrected below
+
+```{r}
+df$ChinaHubei[22] = 48206
+df$ChinaHubei[23] = 51986
+df$ChinaHubei[32] = 63454
+df$ChinaHubei
+```
+
+```{r}
+hubei_df = transform_intervention_df(df$date, df$ChinaHubei)
+hubei_df[86,2] = 0   # 4-17 anormaly
+```
+
+2020-02-12 looks weird, how are we gonna deal with them?
+
+
+we need to change our model parameter below to produce a better result
+
+```{r}
+hubei_intervention_days = c('2020-01-27', '2020-03-25', '2020-04-08')
+hubei_dat = initiate_dat(intervention_df = hubei_df[11:nrow(hubei_df),], # start from 2020-02-02 as over 4000?
+                         intervention_days = hubei_intervention_days,
+                         # definition for parameters below are same as in stan file
+                         alphavar = 0.01,      
+                         betavar = 0.01,
+                         alpha0mean = 0.50515, # log(3.2) 3.2 is in CI of R0 in Hubei in many papers
+                         alpha0var = 1)
+```
+
+
+```{r}
+stan_model1 = 'Rtintervention.stan'
+hubei_fit <- stan(file = stan_model1,
+            data = hubei_dat, 
+            iter = 10000, 
+            chains = 4,
+            # control=list(adapt_delta=0.8),
+            )
+```
+
+
+
+plot for Rt_mean with 95% CI as ribbon. 
+
+```{r}
+Rt_mean = c()
+Rt_sd = c()
+Rt_lower = c()
+Rt_upper = c()
+for (n in 1:length(hubei_dat$incidents)){
+  Rt_mat = as.matrix(hubei_fit, pars = paste('Rt[', as.character(n),']'))
+  Rt_mean[n] = mean(Rt_mat)
+  Rt_sd[n] = sd(Rt_mat)
+  Rt_lower[n] = quantile(Rt_mat, probs = 0.025)
+  Rt_upper[n] = quantile(Rt_mat, probs = 0.975)
+}
+hubei_Rt_df = data.frame(day = (1:length(hubei_dat$incidents))-1,
+                         Rt_mean = Rt_mean, 
+                         Rt_sd = Rt_sd, 
+                         Rt_approx = hubei_dat$incidents/hubei_dat$infec_pot,
+                         incidents = hubei_dat$incidents)
+hubei_Rt_plot = ggplot(data = hubei_Rt_df, aes(x = day, y = Rt_mean))+geom_path()
+hubei_Rt_plot = hubei_Rt_plot + geom_ribbon(aes(ymin = Rt_lower, ymax = Rt_upper))
+hubei_Rt_plot = hubei_Rt_plot + geom_hline(aes(yintercept = 1))
+hubei_Rt_plot = hubei_Rt_plot + ylim(0,7)
+hubei_Rt_plot
+```
+```{r}
+print(hubei_fit, pars = "beta")
+```
+```{r}
+hubei_Rt_plot1 = ggplot(data = hubei_Rt_df, aes(x = day, y = incidents))+geom_path()
+hubei_Rt_plot1
+grid.arrange(hubei_Rt_plot, hubei_Rt_plot1, ncol=2)
+```
+
+test our model quality by generating incidence_rep based on poisson(Rt*Lambdat)
+
+```{r}
+incidents_rep = as.matrix(hubei_fit, pars = 'incidents_rep')
+dim(incidents_rep)
+```
+
+change t which is day t
+
+```{r}
+t = 25
+I_rep_df = data.frame(incidents_rep)
+hubei_Rt_plot2 = ggplot(data = I_rep_df, aes(x = I_rep_df[,t+1])) 
+hubei_Rt_plot2 = hubei_Rt_plot2 + geom_histogram(binwidth=5, fill = 'lightblue') 
+hubei_Rt_plot2 = hubei_Rt_plot2 + geom_vline(aes(xintercept = hubei_dat$incidents[t+1]), color = 'red')
+hubei_Rt_plot2 = hubei_Rt_plot2 + labs(x = 'incidents',
+                                       y = 'count',
+                                       title = 'Model Quality Check')
+hubei_Rt_plot2
+```
+
+
+
+anormaly
+
+```{r}
+df$`United Kingdom`[120] = (df$'United Kingdom'[119]+df$'United Kingdom'[121])/2
+df$`United Kingdom`
+```
+
+Now we can deal with UK 
+
+```{r}
+UK_df = transform_intervention_df(df$date, df$`United Kingdom`)
+
+```
+
+
+
+we need to change our model parameter below to produce a better result
+
+```{r}
+UK_intervention_days = c('2020-03-23','2020-05-10','2020-06-01')
+UK_dat = initiate_dat(intervention_df = UK_df[58:nrow(UK_df),], # start from 2020-03-20 as over 4000?
+                         intervention_days = UK_intervention_days,
+                         # definition for parameters below are same as in stan file
+                         alphavar = 1,      
+                         betavar = 1,
+                         alpha0mean = 0.3617, # log(2.3) 2.3 is in CI of R0 in UK in March?
+                         alpha0var = 1)
+```
+
+also try change iter?
+
+```{r}
+stan_model1 = 'Rtintervention.stan'
+UK_fit <- stan(file = stan_model1,
+            data = UK_dat, 
+            iter = 30000, 
+            chains = 4,
+            control = list(max_treedepth = 15)
+            # control=list(adapt_delta=0.8),
+            )
+```
+
+plot for Rt_mean with 95% CI as ribbon]
+
+```{r}
+Rt_mean = c()
+Rt_sd = c()
+Rt_lower = c()
+Rt_upper = c()
+for (n in 1:length(UK_dat$incidents)){
+  Rt_mat = as.matrix(UK_fit, pars = paste('Rt[', as.character(n),']'))
+  Rt_mean[n] = mean(Rt_mat)
+  Rt_sd[n] = sd(Rt_mat)
+  Rt_lower[n] = quantile(Rt_mat, probs = 0.025)
+  Rt_upper[n] = quantile(Rt_mat, probs = 0.975)
+}
+UK_Rt_df = data.frame(day = (1:length(UK_dat$incidents))-1,
+                         Rt_mean = Rt_mean, 
+                         Rt_sd = Rt_sd, 
+                         Rt_approx = UK_dat$incidents/UK_dat$infec_pot)
+UK_Rt_plot = ggplot(data = UK_Rt_df, aes(x = day, y = Rt_mean))+geom_path()
+UK_Rt_plot = UK_Rt_plot + geom_ribbon(aes(ymin = Rt_lower, ymax = Rt_upper))
+UK_Rt_plot = UK_Rt_plot + geom_hline(aes(yintercept = 1))
+UK_Rt_plot = UK_Rt_plot + ylim(0,13)
+UK_Rt_plot
+```
+
+
+```{r}
+print(UK_fit, pars = 'beta', probs = c(0.05, 0.95))
+
+```
+test our model quality by generating incidence_rep based on poisson(Rt*Lambdat)
+
+```{r}
+incidents_rep = as.matrix(UK_fit, pars = 'incidents_rep')
+dim(incidents_rep)
+```
+
+
+```{r}
+t = 25
+I_rep_df = data.frame(incidents_rep)
+UK_Rt_plot2 = ggplot(data = I_rep_df, aes(x = I_rep_df[,t+1])) 
+UK_Rt_plot2 = UK_Rt_plot2 + geom_histogram(binwidth=5, fill = 'lightblue') 
+UK_Rt_plot2 = UK_Rt_plot2 + geom_vline(aes(xintercept = UK_dat$incidents[t+1]), color = 'red')
+UK_Rt_plot2 = UK_Rt_plot2 + labs(x = 'incidents',
+                                       y = 'count',
+                                       title = 'Model Quality Check')
+UK_Rt_plot2
+```
+
+
+
+
+
+Now we can deal with Greece
+
+```{r}
+Greece_df = transform_intervention_df(df$date, df$Greece)
+
+```
+
+
+
+we need to change our model parameter below to produce a better result
+
+```{r}
+Greece_intervention_days = c('2020-02-27', '2020-03-10', '2020-03-13','2020-03-22','2020-05-04','2020-05-11')
+Greece_dat = initiate_dat(intervention_df = Greece_df[43:nrow(Greece_df),], # start from 2020-03-05?
+                         intervention_days = Greece_intervention_days,
+                         # definition for parameters below are same as in stan file
+                         alphavar = 1,      
+                         betavar = 1,
+                         alpha0mean = 0.3617, # log(2.3) 2.3 simply guessing
+                         alpha0var = 1)
+```
+
+also try change iter?
+
+```{r}
+stan_model1 = 'Rtintervention.stan'
+Greece_fit <- stan(file = stan_model1,
+            data = Greece_dat, 
+            iter = 10000, 
+            chains = 4,
+            control = list(max_treedepth = 15)
+            # control=list(adapt_delta=0.8),
+            )
+```
+
+plot for Rt_mean with s.d. as ribbon.
+
+```{r}
+Rt_mean = c()
+Rt_sd = c()
+for (n in 1:length(Greece_dat$incidents)){
+  Rt_mat = as.matrix(Greece_fit, pars = paste('Rt[', as.character(n),']'))
+  Rt_mean[n] = mean(Rt_mat)
+  Rt_sd[n] = sd(Rt_mat)
+}
+Greece_Rt_df = data.frame(day = (1:length(Greece_dat$incidents))-1,
+                         Rt_mean = Rt_mean, 
+                         Rt_sd = Rt_sd, 
+                         Rt_approx = Greece_dat$incidents/Greece_dat$infec_pot)
+Greece_Rt_plot = ggplot(data = Greece_Rt_df, aes(x = day, y = Rt_mean))+geom_path()
+Greece_Rt_plot = Greece_Rt_plot + geom_ribbon(aes(ymin = Rt_mean-Rt_sd, ymax = Rt_mean+Rt_sd))
+Greece_Rt_plot = Greece_Rt_plot + geom_hline(aes(yintercept = 1))
+Greece_Rt_plot = Greece_Rt_plot + ylim(0,5)
+Greece_Rt_plot
+```
+```{r}
+print(Greece_fit, pars = 'Rt')
+```
+
+
+
+test our model quality by generating incidence_rep based on poisson(Rt*Lambdat)
+
+```{r}
+incidents_rep = as.matrix(Greece_fit, pars = 'incidents_rep')
+dim(incidents_rep)
+```
+
+```{r}
+t = 25
+I_rep_df = data.frame(incidents_rep)
+Greece_Rt_plot2 = ggplot(data = I_rep_df, aes(x = I_rep_df[,t+1])) 
+Greece_Rt_plot2 = Greece_Rt_plot2 + geom_histogram(binwidth=2, fill = 'lightblue') 
+Greece_Rt_plot2 = Greece_Rt_plot2 + geom_vline(aes(xintercept = Greece_dat$incidents[t+1]), color = 'red')
+Greece_Rt_plot2 = Greece_Rt_plot2 + labs(x = 'incidents',
+                                       y = 'count',
+                                       title = 'Model Quality Check')
+Greece_Rt_plot2
+```
+
+
+
+
+
+
+
+
+
+
+

@@ -30,6 +30,8 @@ inf_pot <- function(locnum, impnum, day){
     omega = pgamma(n+0.5, shape = 6.5, rate = 0.62) - pgamma(n-0.5, shape = 6.5, rate = 0.62)
     omega_mat[n] = omega
   }
+  # normalize the data
+  omega_mat = omega_mat/sum(omega_mat)
   omega_mat = matrix(omega_mat)
   totnum_mat = matrix(totnum[day:1], nrow = 1,  ncol = day)
   infectionpot = c(totnum_mat %*% omega_mat)
@@ -79,6 +81,8 @@ cumutodaily <- function(df){
   '
   df: vertical dataframe representing cumulative infection number
   '
+  # to clean levels in dataframe
+  df = as.numeric(as.character(df))
   for (n in length(df):2){
     df[n] = df[n] - df[n-1]
   }
@@ -86,22 +90,24 @@ cumutodaily <- function(df){
 }
 ```
 
-trial case for UK
+trial case for Korea
 Assuming all incidents are from local
 
 ```{r}
 df = covid19(country = 'GBR')
 df$incidents = cumutodaily(df$confirmed)
 daynum = length(df$date) - 1
-tau = 4
-Rt_list = rep(0,k)
-l_list = rep(0,k)
-u_list = rep(0,k)
+tau = 5
+Rt_list = rep(0,tau)
+l_list = rep(0,tau)
+u_list = rep(0,tau)
 for (n in tau:daynum){
   parameter = covidRt(locnum = c(df$incidents), 
                       impnum = 0, 
                       day = n,
                       timewindow = tau,
+                      start_shape  = 1,
+                      start_rate = 0.2
                       )
   Rt_list[n+1] = parameter[1]
   l_list[n+1] = parameter[2]
@@ -110,9 +116,20 @@ for (n in tau:daynum){
 df$Rt = Rt_list
 df$lower = l_list
 df$upper = u_list
+df3 = df
 a = ggplot(data = df, aes(x= df$date,y = df$Rt,))+geom_path() + ylim(0, 10)
 a = a + geom_hline(yintercept = 1)
 a = a + geom_ribbon(aes(ymin = l_list, ymax = u_list),linetype = 2, alpha = 0.1)
 a
 ```
+```{r}
+df = read.csv('Covid_China.csv')
+colnames(df)[colnames(df) == "Province.State"] <- "Date"
+hubei_df = data.frame(Date = df$Date[-(1:3)], Confirmed = df$Hubei[-(1:3)])
+hubei_df
+```
+```{r}
+hubei_df$hubei_daily = cumutodaily(hubei_df$Confirmed)
 
+ggplot(data = hubei_df, aes(x = Date, y = Confirmed)) + geom_path()
+```
